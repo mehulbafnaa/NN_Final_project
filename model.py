@@ -21,8 +21,20 @@ np.random.seed(seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(seed)
 
-# Check if CUDA is available
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Set up device for Mac
+if torch.backends.mps.is_available():
+    # Apple Silicon Mac with Metal support
+    device = torch.device("mps")
+    print("Using MPS (Metal Performance Shaders) for Apple Silicon Mac")
+elif torch.cuda.is_available():
+    # Intel Mac with external GPU
+    device = torch.device("cuda")
+    print("Using CUDA GPU")
+else:
+    # Fallback to CPU
+    device = torch.device("cpu")
+    print("Using CPU - training will be slower")
+    
 print(f"Using device: {device}")
 
 # 1. Dataset Preparation
@@ -185,7 +197,10 @@ adversarial_loss = nn.BCEWithLogitsLoss()
 class VGGPerceptualLoss(nn.Module):
     def __init__(self):
         super(VGGPerceptualLoss, self).__init__()
-        vgg = models.vgg16(pretrained=True).features.to(device).eval()
+        # Updated for newer PyTorch versions and Mac compatibility
+        vgg = models.vgg16(weights=models.VGG16_Weights.DEFAULT).features
+        vgg = vgg.to(device).eval()
+        
         self.slice1 = torch.nn.Sequential()
         self.slice2 = torch.nn.Sequential()
         self.slice3 = torch.nn.Sequential()
@@ -200,6 +215,7 @@ class VGGPerceptualLoss(nn.Module):
         for x in range(16, 23):
             self.slice4.add_module(str(x), vgg[x])
         
+        # Freeze parameters
         for param in self.parameters():
             param.requires_grad = False
     
@@ -504,12 +520,17 @@ def enhance_image(generator, image_path, output_path=None):
 
 # 8. Main execution
 def main():
-    # Paths to your dataset
-    data_root = "path/to/LOL_dataset"  # Replace with actual path
+    # Mac-friendly path handling
+    import os.path
+    
+    # Paths to your dataset - using os.path.expanduser for Mac home directory support
+    data_root = os.path.expanduser("~/Downloads/LOL_dataset")  # Adjust as needed
     
     # Check if dataset paths exist
     if not os.path.exists(data_root):
-        print("Dataset path doesn't exist. Please update the path.")
+        print(f"Dataset path {data_root} doesn't exist. Please update the path.")
+        print("If you haven't downloaded the LOL dataset yet, you can find it at:")
+        print("https://daooshee.github.io/BMVC2018website/")
         return
     
     # Create datasets and data loaders
@@ -540,6 +561,25 @@ def main():
     # Initialize models
     generator = UNetGenerator().to(device)
     discriminator = PatchGANDiscriminator().to(device)
+    
+    # Mac optimization: Set num_workers properly for DataLoader
+    # For Mac, using too many workers can cause issues
+    num_workers = 0 if device.type == 'mps' else 2
+    
+    # Update DataLoader configurations
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=4,
+        shuffle=True,
+        num_workers=num_workers
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=4,
+        shuffle=False,
+        num_workers=num_workers
+    )
     
     # Train the model
     history = train_model(generator, discriminator, train_loader, val_loader, num_epochs=50)
