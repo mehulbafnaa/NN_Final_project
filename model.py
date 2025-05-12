@@ -21,20 +21,7 @@ np.random.seed(seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(seed)
 
-# Set up device for Mac
-if torch.backends.mps.is_available():
-    # Apple Silicon Mac with Metal support
-    device = torch.device("mps")
-    print("Using MPS (Metal Performance Shaders) for Apple Silicon Mac")
-elif torch.cuda.is_available():
-    # Intel Mac with external GPU
-    device = torch.device("cuda")
-    print("Using CUDA GPU")
-else:
-    # Fallback to CPU
-    device = torch.device("cpu")
-    print("Using CPU - training will be slower")
-    
+device = torch.device(torch.accelerator.current_accelerator().type) if torch.accelerator.is_available() else torch.device("cpu")
 print(f"Using device: {device}")
 
 # 1. Dataset Preparation
@@ -92,8 +79,8 @@ class UNetBlock(nn.Module):
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 4, 2, 1, bias=False) if down 
             else nn.ConvTranspose2d(in_channels, out_channels, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(out_channels) if bn else nn.Identity(),
-            nn.ReLU(True) if relu else nn.LeakyReLU(0.2, True),
+            nn.InstanceNorm2d(out_channels) if bn else nn.Identity(),
+            nn.GELU(),
             nn.Dropout(0.5) if dropout else nn.Identity()
         )
     
@@ -154,40 +141,40 @@ class PatchGANDiscriminator(nn.Module):
         
         # Input: concatenated low-light and enhanced/normal image (6 channels)
         self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels, features, 4, 2, 1),
-            nn.LeakyReLU(0.2, True)
+            nn.utils.spectral_norm(nn.Conv2d(in_channels, features, 4, 2, 1)),
+            nn.GELU()
         )
         
         self.conv2 = nn.Sequential(
-            nn.Conv2d(features, features*2, 4, 2, 1, bias=False),
+            nn.utils.spectral_norm(nn.Conv2d(features, features*2, 4, 2, 1, bias=False)),
             nn.BatchNorm2d(features*2),
-            nn.LeakyReLU(0.2, True)
+            nn.GELU()
         )
         
         self.conv3 = nn.Sequential(
-            nn.Conv2d(features*2, features*4, 4, 2, 1, bias=False),
+            nn.utils.spectral_norm(nn.Conv2d(features*2, features*4, 4, 2, 1, bias=False)),
             nn.BatchNorm2d(features*4),
-            nn.LeakyReLU(0.2, True)
+            nn.GELU()
         )
         
         self.conv4 = nn.Sequential(
-            nn.Conv2d(features*4, features*8, 4, 1, 1, bias=False),
+            nn.utils.spectral_norm(nn.Conv2d(features*4, features*8, 4, 1, 1, bias=False)),
             nn.BatchNorm2d(features*8),
-            nn.LeakyReLU(0.2, True)
+            nn.GELU()
         )
         
         # Output: 1-channel prediction map
-        self.final = nn.Conv2d(features*8, 1, 4, 1, 1)
+        self.final = nn.utils.spectral_norm(nn.Conv2d(features*8, 1, 4, 1, 1))
     
     def forward(self, x, y):
         # x: low-light image, y: enhanced/normal image
         input_tensor = torch.cat([x, y], dim=1)
-        x = self.conv1(input_tensor)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        x = self.conv4(x)
-        x = self.final(x)
-        return x
+        x1 = self.conv1(input_tensor)
+        x2 = self.conv2(x1)
+        x3 = self.conv3(x2)
+        x4 = self.conv4(x3)
+        x = self.final(x4)
+        return x, [x1, x2, x3, x4]
 
 # 3. Loss Functions
 # 3.1 Adversarial Loss
@@ -254,17 +241,41 @@ l1_loss = nn.L1Loss()
 # 4. Training Pipeline
 def train_model(generator, discriminator, train_loader, val_loader, num_epochs=50):
     # Optimizers
-    optimizer_G = optim.Adam(generator.parameters(), lr=0.0002, betas=(0.5, 0.999))
-    optimizer_D = optim.Adam(discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
+    optimizer_G = optim.Adam(generator.parameters(), lr=0.0001, betas=(0.5, 0.999))
+    optimizer_D = optim.Adam(discriminator.parameters(), lr=0.0001, betas=(0.5, 0.999))
     
-    # Learning rate schedulers
-    scheduler_G = optim.lr_scheduler.StepLR(optimizer_G, step_size=20, gamma=0.5)
-    scheduler_D = optim.lr_scheduler.StepLR(optimizer_D, step_size=20, gamma=0.5)
+    # Learning rate schedulers with warmup
+    def warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor):
+        def f(x):
+            if x >= warmup_iters:
+                return 1
+            alpha = float(x) / warmup_iters
+            return warmup_factor * (1 - alpha) + alpha
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, f)
     
-    # Loss weights
-    lambda_adv = 1.0
-    lambda_pixel = 100.0
-    lambda_perceptual = 10.0
+    warmup_iters = min(1000, len(train_loader) - 1)
+    warmup_scheduler_G = warmup_lr_scheduler(optimizer_G, warmup_iters, 0.001)
+    warmup_scheduler_D = warmup_lr_scheduler(optimizer_D, warmup_iters, 0.001)
+    
+    # Main schedulers with more aggressive decay
+    scheduler_G = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer_G, 
+        T_0=10,  # Restart every 10 epochs
+        T_mult=2,  # Double the restart interval after each restart
+        eta_min=1e-6
+    )
+    scheduler_D = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer_D, 
+        T_0=10,
+        T_mult=2,
+        eta_min=1e-6
+    )
+    
+    # Loss weights - further adjusted for better generator training
+    lambda_adv = 0.05  # Further reduced adversarial loss weight
+    lambda_pixel = 300.0  # Further increased pixel-wise loss weight
+    lambda_perceptual = 30.0  # Further increased perceptual loss weight
+    lambda_feature = 10.0  # New feature matching loss weight
     
     # Initialize the perceptual loss
     perceptual_loss = VGGPerceptualLoss().to(device)
@@ -274,6 +285,9 @@ def train_model(generator, discriminator, train_loader, val_loader, num_epochs=5
         'g_loss': [], 'd_loss': [], 'val_psnr': [], 'val_ssim': []
     }
     
+    # Gradient clipping value
+    clip_value = 0.5
+    
     for epoch in range(num_epochs):
         # Training
         generator.train()
@@ -282,15 +296,15 @@ def train_model(generator, discriminator, train_loader, val_loader, num_epochs=5
         train_g_loss = 0.0
         train_d_loss = 0.0
         
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")):
             # Get data
             low_imgs = batch['low'].to(device)
             normal_imgs = batch['normal'].to(device)
             batch_size = low_imgs.size(0)
             
-            # Real and fake labels
-            real_label = torch.ones((batch_size, 1, 30, 30), device=device)
-            fake_label = torch.zeros((batch_size, 1, 30, 30), device=device)
+            # Real and fake labels with label smoothing
+            real_label = torch.ones((batch_size, 1, 30, 30), device=device) * 0.9
+            fake_label = torch.zeros((batch_size, 1, 30, 30), device=device) + 0.1
             
             #------------------------
             # Train Discriminator
@@ -302,16 +316,20 @@ def train_model(generator, discriminator, train_loader, val_loader, num_epochs=5
                 enhanced_imgs = generator(low_imgs)
             
             # Real loss
-            pred_real = discriminator(low_imgs, normal_imgs)
+            pred_real, real_features = discriminator(low_imgs, normal_imgs)
             d_real_loss = adversarial_loss(pred_real, real_label)
             
             # Fake loss
-            pred_fake = discriminator(low_imgs, enhanced_imgs.detach())
+            pred_fake, _ = discriminator(low_imgs, enhanced_imgs.detach())
             d_fake_loss = adversarial_loss(pred_fake, fake_label)
             
             # Total discriminator loss
             d_loss = (d_real_loss + d_fake_loss) / 2
             d_loss.backward()
+            
+            # Gradient clipping for discriminator
+            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), clip_value)
+            
             optimizer_D.step()
             
             #------------------------
@@ -319,11 +337,11 @@ def train_model(generator, discriminator, train_loader, val_loader, num_epochs=5
             #------------------------
             optimizer_G.zero_grad()
             
-            # Generate enhanced images again (needed because we detached earlier)
+            # Generate enhanced images again
             enhanced_imgs = generator(low_imgs)
             
             # Adversarial loss
-            pred_fake = discriminator(low_imgs, enhanced_imgs)
+            pred_fake, fake_features = discriminator(low_imgs, enhanced_imgs)
             g_adv_loss = adversarial_loss(pred_fake, real_label)
             
             # Pixel-wise loss
@@ -332,16 +350,34 @@ def train_model(generator, discriminator, train_loader, val_loader, num_epochs=5
             # Perceptual loss
             g_percep_loss = perceptual_loss(enhanced_imgs, normal_imgs)
             
+            # Feature matching loss
+            g_feature_loss = 0.0
+            for fake_feat, real_feat in zip(fake_features, real_features):
+                g_feature_loss += F.l1_loss(fake_feat, real_feat.detach())
+            
             # Total generator loss
-            g_loss = lambda_adv * g_adv_loss + lambda_pixel * g_pixel_loss + lambda_perceptual * g_percep_loss
+            g_loss = (lambda_adv * g_adv_loss + 
+                     lambda_pixel * g_pixel_loss + 
+                     lambda_perceptual * g_percep_loss +
+                     lambda_feature * g_feature_loss)
+            
             g_loss.backward()
+            
+            # Gradient clipping for generator
+            torch.nn.utils.clip_grad_norm_(generator.parameters(), clip_value)
+            
             optimizer_G.step()
+            
+            # Update learning rates with warmup
+            if batch_idx < warmup_iters:
+                warmup_scheduler_G.step()
+                warmup_scheduler_D.step()
             
             # Save losses
             train_g_loss += g_loss.item()
             train_d_loss += d_loss.item()
         
-        # Step the schedulers
+        # Step the main schedulers
         scheduler_G.step()
         scheduler_D.step()
         
@@ -519,12 +555,12 @@ def enhance_image(generator, image_path, output_path=None):
     return enhanced_image
 
 # 8. Main execution
-def main():
+def main(data_path=None):
     # Mac-friendly path handling
     import os.path
     
     # Paths to your dataset - using os.path.expanduser for Mac home directory support
-    data_root = os.path.expanduser("~/Downloads/LOL_dataset")  # Adjust as needed
+    data_root = os.path.expanduser(data_path)  # Adjust as needed
     
     # Check if dataset paths exist
     if not os.path.exists(data_root):
@@ -582,7 +618,7 @@ def main():
     )
     
     # Train the model
-    history = train_model(generator, discriminator, train_loader, val_loader, num_epochs=50)
+    history = train_model(generator, discriminator, train_loader, val_loader, num_epochs=100)
     
     # Plot training history
     plt.figure(figsize=(12, 5))
@@ -621,4 +657,5 @@ def main():
         enhance_image(generator, test_image_path, "enhanced_output.jpg")
 
 if __name__ == "__main__":
-    main()
+    data_path = "~/Downloads/LOL_dataset"
+    main(data_path)
