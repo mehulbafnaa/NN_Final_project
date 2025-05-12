@@ -1,0 +1,6 @@
+checkpoints/
+plots/
+*.png
+*.jpg
+*.jpeg
+*.webp
